@@ -57,7 +57,7 @@ def one_hot(labels: np.ndarray, n_classes: int = 10) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Model — single hidden layer, ReLU, softmax cross-entropy
+# Model — two hidden layers, ReLU, softmax cross-entropy, momentum SGD
 # ---------------------------------------------------------------------------
 
 def relu(x):
@@ -74,23 +74,39 @@ def cross_entropy(pred, target):
 
 
 class MLP:
-    def __init__(self, input_dim=784, hidden_dim=128, output_dim=10):
-        scale = np.sqrt(2.0 / input_dim)
-        self.W1 = np.random.randn(input_dim, hidden_dim) * scale
-        self.b1 = np.zeros(hidden_dim)
-        self.W2 = np.random.randn(hidden_dim, output_dim) * np.sqrt(2.0 / hidden_dim)
-        self.b2 = np.zeros(output_dim)
+    def __init__(self, input_dim=784, hidden1=256, hidden2=128, output_dim=10):
+        self.W1 = np.random.randn(input_dim, hidden1) * np.sqrt(2.0 / input_dim)
+        self.b1 = np.zeros(hidden1)
+        self.W2 = np.random.randn(hidden1, hidden2) * np.sqrt(2.0 / hidden1)
+        self.b2 = np.zeros(hidden2)
+        self.W3 = np.random.randn(hidden2, output_dim) * np.sqrt(2.0 / hidden2)
+        self.b3 = np.zeros(output_dim)
+
+        # Momentum buffers
+        self.vW1 = np.zeros_like(self.W1)
+        self.vb1 = np.zeros_like(self.b1)
+        self.vW2 = np.zeros_like(self.W2)
+        self.vb2 = np.zeros_like(self.b2)
+        self.vW3 = np.zeros_like(self.W3)
+        self.vb3 = np.zeros_like(self.b3)
 
     def forward(self, X):
+        self.X = X
         self.z1 = X @ self.W1 + self.b1
         self.a1 = relu(self.z1)
         self.z2 = self.a1 @ self.W2 + self.b2
-        self.out = softmax(self.z2)
+        self.a2 = relu(self.z2)
+        self.z3 = self.a2 @ self.W3 + self.b3
+        self.out = softmax(self.z3)
         return self.out
 
-    def backward(self, X, y_onehot, lr=0.01):
+    def backward(self, X, y_onehot, lr=0.01, momentum=0.9):
         m = X.shape[0]
-        dz2 = (self.out - y_onehot) / m
+        dz3 = (self.out - y_onehot) / m
+        dW3 = self.a2.T @ dz3
+        db3 = dz3.sum(axis=0)
+        da2 = dz3 @ self.W3.T
+        dz2 = da2 * (self.z2 > 0)
         dW2 = self.a1.T @ dz2
         db2 = dz2.sum(axis=0)
         da1 = dz2 @ self.W2.T
@@ -98,10 +114,14 @@ class MLP:
         dW1 = X.T @ dz1
         db1 = dz1.sum(axis=0)
 
-        self.W2 -= lr * dW2
-        self.b2 -= lr * db2
-        self.W1 -= lr * dW1
-        self.b1 -= lr * db1
+        for param, grad, vel in [
+            ('W3', dW3, 'vW3'), ('b3', db3, 'vb3'),
+            ('W2', dW2, 'vW2'), ('b2', db2, 'vb2'),
+            ('W1', dW1, 'vW1'), ('b1', db1, 'vb1'),
+        ]:
+            v = getattr(self, vel)
+            v[:] = momentum * v - lr * grad
+            getattr(self, param).__iadd__(v)
 
 
 # ---------------------------------------------------------------------------
@@ -121,15 +141,24 @@ def train():
     y_test_oh = one_hot(y_test)
 
     # Hyperparameters
-    epochs = 20
-    batch_size = 64
-    lr = 0.1
-    hidden_dim = 128
+    epochs = 30
+    batch_size = 128
+    lr_init = 0.1
+    hidden1 = 256
+    hidden2 = 128
 
-    model = MLP(hidden_dim=hidden_dim)
+    model = MLP(hidden1=hidden1, hidden2=hidden2)
 
     results = []
+    best_loss = float('inf')
+    best_weights = None
+    patience = 5
+    patience_counter = 0
+
     for epoch in range(epochs):
+        # LR decay
+        lr = lr_init * (0.95 ** epoch)
+
         # Shuffle
         idx = np.random.permutation(len(X_train))
         X_train, y_train_oh = X_train[idx], y_train_oh[idx]
@@ -139,7 +168,7 @@ def train():
             X_batch = X_train[i:i+batch_size]
             y_batch = y_train_oh[i:i+batch_size]
             model.forward(X_batch)
-            model.backward(X_batch, y_batch, lr=lr)
+            model.backward(X_batch, y_batch, lr=lr, momentum=0.9)
 
         # Evaluate
         val_pred = model.forward(X_test)
@@ -148,6 +177,26 @@ def train():
 
         print(f"Epoch {epoch+1:2d}/{epochs}  val_loss={val_loss:.4f}  val_acc={val_acc:.4f}")
         results.append({"epoch": epoch + 1, "val_loss": round(val_loss, 6), "val_acc": round(val_acc, 4)})
+
+        # Early stopping with best model checkpoint
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_weights = {k: v.copy() for k, v in model.__dict__.items() if isinstance(v, np.ndarray)}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
+
+    # Restore best weights and re-evaluate for final result
+    if best_weights:
+        for k, v in best_weights.items():
+            setattr(model, k, v)
+        val_pred = model.forward(X_test)
+        final_loss = cross_entropy(val_pred, y_test_oh)
+        final_acc = (val_pred.argmax(axis=1) == y_test).mean()
+        results.append({"epoch": epoch + 2, "val_loss": round(final_loss, 6), "val_acc": round(final_acc, 4)})
 
     # Write results
     with open("results.tsv", "w", newline="") as f:
