@@ -1,0 +1,5 @@
+# Nbench project config
+metric: val_loss
+direction: minimize
+train: python train.py
+results: results.tsv
